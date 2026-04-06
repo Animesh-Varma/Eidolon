@@ -1,0 +1,7 @@
+pyttsx3
+vosk
+sounddevice
+numpy
+
+#macOS
+pyobjc
