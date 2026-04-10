@@ -1,7 +1,33 @@
-pyttsx3
-vosk
-sounddevice
-numpy
+# ==========================================
+# EIDOLON: macOS Setup Instructions
+# ==========================================
+# BEFORE running `pip install -r requirements.txt` on a Mac, you MUST install PortAudio:
+#   $ brew install portaudio
+#
+# APPLE SILICON FIX:
+# If PyAudio fails to build, install it manually with Homebrew paths:
+#   $ pip install pyaudio --global-option="build_ext" \
+#       --global-option="-I$(brew --prefix)/include" \
+#       --global-option="-L$(brew --prefix)/lib"
+#
+# MACOS PRIVACY PERMISSIONS REQUIRED:
+# 1. System Settings > Privacy & Security > Bluetooth
+#    -> Grant access to your Terminal / PyCharm / VSCode.
+# 2. System Settings > Privacy & Security > Microphone
+#    -> Grant access to your Terminal / PyCharm / VSCode. (If you skip this, PyAudio records pure silence or crashes).
+# ==========================================
 
-#macOS
-pyobjc
+# --- Core Logic & Audio I/O ---
+SpeechRecognition
+numpy
+sounddevice
+pyaudio
+
+# --- AI Engines (PoC Future-Proofing) ---
+vosk
+pyttsx3
+
+# --- macOS Native Bridge (Only installs on Mac) ---
+pyobjc-core; sys_platform == 'darwin'
+pyobjc-framework-Cocoa; sys_platform == 'darwin'
+pyobjc-framework-IOBluetooth; sys_platform == 'darwin'
