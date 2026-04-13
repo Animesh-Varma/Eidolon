@@ -1,3 +1,4 @@
+import os
 import time
 import threading
 import queue
@@ -10,7 +11,7 @@ import Foundation
 
 from .base_controller import BaseController
 
-DEBUG = True
+DEBUG = os.environ.get("EIDOLON_DEBUG", "").lower() in ("1", "true", "yes")
 
 NSMutableDictionary = objc.lookUpClass("NSMutableDictionary")
 NSMutableArray = objc.lookUpClass("NSMutableArray")

@@ -180,7 +180,8 @@ class LocalAIEngine:
                 self.tts_active = True
 
                 if sys.platform == 'darwin':
-                    subprocess.run(['say', text])
+                    sanitized = re.sub(r'[^\w\s.,!?\'-]', '', text)[:500]
+                    subprocess.run(['say', sanitized])
                 else:
                     self.ui_queue.put(("log", "[System]: Digital TTS injection executed."))
 

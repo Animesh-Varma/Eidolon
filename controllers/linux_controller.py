@@ -1,8 +1,12 @@
 import time
+import logging
 from .base_controller import BaseController
+
+logger = logging.getLogger(__name__)
 
 class LinuxController(BaseController):
     def __init__(self):
+        super().__init__()
         self.connected = False
         # Here you would typically import dbus and setup BlueZ sockets
 
@@ -21,6 +25,14 @@ class LinuxController(BaseController):
     def write_audio(self, audio_bytes: bytes):
         # Write bytes directly to SCO socket
         pass
+
+    def send_at_command(self, cmd_bytes: bytes):
+        # TODO: Implement AT command sending over RFCOMM socket
+        logger.warning("send_at_command not yet implemented for Linux")
+
+    def open_sco_channel(self):
+        # TODO: Implement SCO channel opening via AF_BLUETOOTH
+        logger.warning("open_sco_channel not yet implemented for Linux")
 
     def stop_server(self):
         self.connected = False

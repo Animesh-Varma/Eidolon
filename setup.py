@@ -7,6 +7,7 @@ import urllib.request
 import zipfile
 import shutil
 import importlib.util
+import shlex
 
 # Safety catch for IDE terminals (PyCharm/VSCode)
 if 'TERM' not in os.environ:
@@ -32,9 +33,11 @@ def is_module_installed(module_name):
 def run_command(command, env=None, capture_output=False, silent=False):
     """Utility to run shell commands safely."""
     try:
+        if isinstance(command, str):
+            command = shlex.split(command)
         result = subprocess.run(
             command,
-            shell=True,
+            shell=False,
             check=True,
             env=env,
             text=True,
@@ -147,8 +150,10 @@ def install_system_dependencies(sys_info, status):
             ans = input("Would you like to install Homebrew now? (Requires admin password) (y/n): ").strip().lower()
             if ans in ['y', 'yes']:
                 print(" -> Running Homebrew installer...")
-                run_command(
-                    '/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"')
+                subprocess.run(
+                    ['/bin/bash', '-c',
+                     '$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)'],
+                    check=True)
                 check_homebrew()
             else:
                 print(f"{RED}[Error] Cannot proceed without Homebrew. Exiting.{RESET}")
@@ -163,7 +168,8 @@ def install_system_dependencies(sys_info, status):
     elif sys_info['os'].startswith('linux'):
         if not status['portaudio_installed']:
             print(" -> Running 'sudo apt-get install portaudio19-dev python3-pyaudio'...")
-            run_command("sudo apt-get update && sudo apt-get install -y portaudio19-dev python3-pyaudio")
+            run_command("sudo apt-get update")
+            run_command("sudo apt-get install -y portaudio19-dev python3-pyaudio")
         else:
             print(" -> PortAudio is already installed.")
 
@@ -208,7 +214,7 @@ def download_vosk_model(status):
     print(f"\n{BOLD}[*] Downloading Vosk STT Model (50MB) from {model_url}...{RESET}")
 
     try:
-        context = ssl._create_unverified_context()
+        context = ssl.create_default_context()
 
         with urllib.request.urlopen(model_url, context=context) as response, open(zip_path, 'wb') as out_file:
             data = response.read()
@@ -217,6 +223,11 @@ def download_vosk_model(status):
         print(" -> Download complete. Extracting...")
 
         with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+            target_dir = os.path.realpath(".")
+            for member in zip_ref.namelist():
+                member_path = os.path.realpath(os.path.join(target_dir, member))
+                if not member_path.startswith(target_dir + os.sep) and member_path != target_dir:
+                    raise ValueError(f"Zip entry '{member}' would extract outside target directory")
             zip_ref.extractall(".")
 
         extracted_folder = "vosk-model-small-en-us-0.15"
