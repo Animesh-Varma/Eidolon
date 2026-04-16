@@ -255,7 +255,7 @@ class MacController(BaseController):
                                     self._pump_runloop(0.1)
 
                                 if self.rfcomm_channel.isOpen():
-                                    self._debug_print(f"\033[92mPort {cid} is genuinely OPEN!\033[0m")
+                                    self._debug_print(f"\033[92mPort {cid} is OPEN!\033[0m")
                                     self.channel_is_open = True
                                     self._pump_runloop(1.5)
 

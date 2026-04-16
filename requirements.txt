@@ -25,7 +25,7 @@ pyaudio
 
 # --- AI Engines (PoC Future-Proofing) ---
 vosk
-pyttsx3
+edge-tts
 
 # --- macOS Native Bridge (Only installs on Mac) ---
 pyobjc-core; sys_platform == 'darwin'

@@ -1,43 +1,31 @@
+import importlib.util
 import os
-import sys
-import ssl
 import platform
+import shutil
+import ssl
 import subprocess
+import sys
 import urllib.request
 import zipfile
-import shutil
-import importlib.util
 
-# Safety catch for IDE terminals (PyCharm/VSCode)
 if 'TERM' not in os.environ:
     os.environ['TERM'] = 'xterm-256color'
 
-# --- ANSI Colors ---
-GREEN = "\033[92m"
-YELLOW = "\033[93m"
-RED = "\033[91m"
-RESET = "\033[0m"
-BOLD = "\033[1m"
+GREEN, YELLOW, RED, RESET, BOLD = "\033[92m", "\033[93m", "\033[91m", "\033[0m", "\033[1m"
 
 
-def clear_screen():
+def clear_screen() -> None:
     os.system('cls' if os.name == 'nt' else 'clear')
 
 
-def is_module_installed(module_name):
-    """Checks if a python package is importable."""
+def is_module_installed(module_name: str) -> bool:
     return importlib.util.find_spec(module_name) is not None
 
 
-def run_command(command, env=None, capture_output=False, silent=False):
-    """Utility to run shell commands safely."""
+def run_command(command: str, env: dict = None, capture_output: bool = False, silent: bool = False):
     try:
         result = subprocess.run(
-            command,
-            shell=True,
-            check=True,
-            env=env,
-            text=True,
+            command, shell=True, check=True, env=env, text=True,
             capture_output=capture_output,
             stdout=subprocess.DEVNULL if silent and not capture_output else None,
             stderr=subprocess.DEVNULL if silent and not capture_output else None
@@ -47,223 +35,162 @@ def run_command(command, env=None, capture_output=False, silent=False):
         return False
 
 
-def check_homebrew():
-    if shutil.which('brew'): return True
-    if os.path.exists('/opt/homebrew/bin/brew'):
-        os.environ['PATH'] += os.pathsep + '/opt/homebrew/bin'
-        return True
-    if os.path.exists('/usr/local/bin/brew'):
-        os.environ['PATH'] += os.pathsep + '/usr/local/bin'
-        return True
-    return False
-
-
-def evaluate_environment(sys_info):
-    """Runs checks to see what is already installed."""
-    status = {
-        "brew_installed": False,
-        "portaudio_installed": False,
-        "pyaudio_installed": is_module_installed('pyaudio'),
-        "deps_installed": all([
-            is_module_installed('speech_recognition'),
-            is_module_installed('numpy'),
-            is_module_installed('sounddevice'),
-            is_module_installed('vosk'),
-            is_module_installed('pyttsx3')
-        ]),
-        "model_installed": os.path.isdir("model")
+def get_system_info() -> dict:
+    sys_info = {
+        "os": sys.platform,
+        "arch": platform.machine(),
+        "is_apple_silicon": sys.platform == "darwin" and platform.machine() == "arm64",
+        "linux_distro": None,
+        "pkg_manager": None
     }
 
-    if sys_info['os'] == 'darwin':
-        status['deps_installed'] = status['deps_installed'] and is_module_installed('objc')
-        status['brew_installed'] = check_homebrew()
-        if status['brew_installed']:
-            status['portaudio_installed'] = run_command("brew ls --versions portaudio", capture_output=True) != ""
-    elif sys_info['os'].startswith('linux'):
-        status['portaudio_installed'] = run_command("dpkg -s portaudio19-dev", capture_output=True,
-                                                    silent=True) != False
-    else:
-        status['portaudio_installed'] = True
+    if sys_info['os'].startswith('linux'):
+        if shutil.which('pacman'):
+            sys_info['pkg_manager'] = "pacman"
+        elif shutil.which('apt-get'):
+            sys_info['pkg_manager'] = "apt"
+        elif shutil.which('dnf'):
+            sys_info['pkg_manager'] = "dnf"
+    return sys_info
 
+
+def evaluate_environment(sys_info: dict) -> dict:
+    status = {
+        "deps_installed": all(
+            is_module_installed(m) for m in ['speech_recognition', 'numpy', 'sounddevice', 'vosk', 'edge_tts']),
+        "model_installed": os.path.isdir("model"),
+        "bt_utils_installed": True
+    }
+    if sys_info['os'].startswith('linux'):
+        status['bt_utils_installed'] = shutil.which('bluetoothctl') is not None
     return status
 
 
-def get_system_info():
-    return {
-        "os": sys.platform,
-        "arch": platform.machine(),
-        "is_apple_silicon": sys.platform == "darwin" and platform.machine() == "arm64"
-    }
+def enforce_sudo_on_linux(sys_info: dict) -> None:
+    """Gracefully exits and provides the exact command if not running as root on Linux."""
+    if sys_info['os'].startswith('linux') and os.geteuid() != 0:
+        clear_screen()
+        print(f"{RED}{BOLD}[Error] Root privileges required for system setup.{RESET}")
+        print("This script needs to install packages via your package manager (pacman/apt/dnf).")
+        print("Please re-run this setup script using sudo, pointing to your virtual environment:\n")
+        print(f"  {GREEN}sudo {sys.executable} setup.py{RESET}\n")
+        sys.exit(1)
 
 
-def format_step(is_done, text):
-    if is_done:
-        return f" {GREEN}[✔]{RESET} {text}"
+def apply_linux_audio_overrides() -> None:
+    print(f"\n{BOLD}[*] Configuring Linux Sound Server Overrides...{RESET}")
+
+    sudo_user = os.environ.get("SUDO_USER")
+    if sudo_user:
+        import pwd
+        home = pwd.getpwnam(sudo_user).pw_dir
     else:
-        return f" [ ] {text}"
+        home = os.path.expanduser("~")
 
+    if shutil.which("wireplumber"):
+        wp_dir = os.path.join(home, ".config", "wireplumber", "wireplumber.conf.d")
+        os.makedirs(wp_dir, exist_ok=True)
+        wp_file = os.path.join(wp_dir, "51-disable-hfp.conf")
 
-def print_plan(sys_info, status):
-    clear_screen()
-    print(f"{BOLD}========================================{RESET}")
-    print(f"{BOLD}      EIDOLON ENVIRONMENT SETUP{RESET}")
-    print(f"{BOLD}========================================{RESET}\n")
-    print(f"Detected OS:   {sys_info['os']}")
-    print(f"Architecture:  {sys_info['arch']}\n")
+        with open(wp_file, "w") as f:
+            f.write("monitor.bluez.properties = {\n  bluez5.roles = [ a2dp_sink a2dp_source ]\n}\n")
 
-    print("The following actions will be performed:")
+        if sudo_user:
+            uid = pwd.getpwnam(sudo_user).pw_uid
+            gid = pwd.getpwnam(sudo_user).pw_gid
+            os.chown(wp_file, uid, gid)
+            os.chown(wp_dir, uid, gid)
 
-    # 1. System Dependencies
-    if sys_info['os'] == 'darwin':
-        if not status['brew_installed']:
-            print(f" {RED}[x]{RESET} Install Homebrew (Missing!)")
-        print(format_step(status['portaudio_installed'],
-                          "Install 'portaudio' via Homebrew (required for Mac Audio I/O)."))
-        if sys_info['is_apple_silicon']:
-            print(format_step(status['pyaudio_installed'],
-                              "Install PyAudio using Apple Silicon specific compiler flags."))
-        else:
-            print(format_step(status['pyaudio_installed'], "Install PyAudio."))
-    elif sys_info['os'].startswith('linux'):
+        print(f" {GREEN}[✔]{RESET} WirePlumber HFP grab disabled. (Applied to user {sudo_user or 'current'})")
+        print(f" {YELLOW}-> Please run `systemctl --user restart wireplumber` AFTER setup, or reboot.{RESET}")
+
+    elif shutil.which("pulseaudio"):
         print(
-            format_step(status['portaudio_installed'], "Install 'portaudio19-dev' via apt (required for Linux Audio)."))
-        print(format_step(status['pyaudio_installed'], "Install PyAudio."))
-    elif sys_info['os'] == 'win32':
-        print(format_step(status['pyaudio_installed'], "Install PyAudio."))
-
-    # 2. Python Dependencies
-    print(format_step(status['deps_installed'], "Install core Python dependencies from requirements.txt."))
-
-    # 3. Model
-    print(format_step(status['model_installed'], "Download and extract the Vosk Offline STT Model (50MB)."))
-    print(f"\n{BOLD}========================================{RESET}")
+            f"{YELLOW}[!] Notice: Running PulseAudio. You may need to manually unload module-bluetooth-discover.{RESET}")
 
 
-def install_system_dependencies(sys_info, status):
-    print(f"\n{BOLD}[*] Checking system dependencies...{RESET}")
-    if sys_info['os'] == 'darwin':
-        if not status['brew_installed']:
-            print(f"{YELLOW}[!] Homebrew is not installed. It is required to install macOS audio libraries.{RESET}")
-            ans = input("Would you like to install Homebrew now? (Requires admin password) (y/n): ").strip().lower()
-            if ans in ['y', 'yes']:
-                print(" -> Running Homebrew installer...")
-                run_command(
-                    '/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"')
-                check_homebrew()
-            else:
-                print(f"{RED}[Error] Cannot proceed without Homebrew. Exiting.{RESET}")
-                sys.exit(1)
-
-        if not status['portaudio_installed']:
-            print(" -> Running 'brew install portaudio'...")
-            run_command("brew install portaudio")
+def install_system_dependencies(sys_info: dict) -> None:
+    print(f"\n{BOLD}[*] Installing System Packages...{RESET}")
+    if sys_info['os'].startswith('linux'):
+        if sys_info['pkg_manager'] == 'pacman':
+            cmd = "pacman -S --noconfirm bluez bluez-utils portaudio ffmpeg"
+        elif sys_info['pkg_manager'] == 'apt':
+            cmd = "apt-get update && apt-get install -y bluez bluez-tools portaudio19-dev python3-pyaudio ffmpeg"
+        elif sys_info['pkg_manager'] == 'dnf':
+            cmd = "dnf install -y bluez bluez-tools portaudio-devel python3-pyaudio ffmpeg"
         else:
-            print(" -> PortAudio is already installed.")
+            print(f"{YELLOW}[!] Unknown package manager. Please install bluez, portaudio, and ffmpeg manually.{RESET}")
+            return
 
-    elif sys_info['os'].startswith('linux'):
-        if not status['portaudio_installed']:
-            print(" -> Running 'sudo apt-get install portaudio19-dev python3-pyaudio'...")
-            run_command("sudo apt-get update && sudo apt-get install -y portaudio19-dev python3-pyaudio")
-        else:
-            print(" -> PortAudio is already installed.")
+        print(f" -> Running: {cmd}")
+        run_command(cmd)
+        apply_linux_audio_overrides()
 
 
-def install_python_dependencies(sys_info, status):
+def install_python_dependencies() -> None:
     print(f"\n{BOLD}[*] Installing Python dependencies...{RESET}")
-
-    if not status['pyaudio_installed']:
-        if sys_info['is_apple_silicon']:
-            print(" -> Apple Silicon detected. Applying custom PyAudio build flags...")
-            try:
-                brew_prefix = subprocess.run(['brew', '--prefix'], capture_output=True, text=True,
-                                             check=True).stdout.strip()
-                custom_env = os.environ.copy()
-                custom_env['CFLAGS'] = f"-I{brew_prefix}/include"
-                custom_env['LDFLAGS'] = f"-L{brew_prefix}/lib"
-                run_command(f"{sys.executable} -m pip install pyaudio", env=custom_env)
-            except Exception as e:
-                print(f"{YELLOW}[Warning] Custom PyAudio install failed: {e}. Attempting standard install...{RESET}")
-                run_command(f"{sys.executable} -m pip install pyaudio")
-        else:
-            run_command(f"{sys.executable} -m pip install pyaudio")
-    else:
-        print(" -> PyAudio is already installed.")
-
-    if not status['deps_installed']:
-        print(" -> Installing requirements.txt...")
-        run_command(f"{sys.executable} -m pip install -r requirements.txt")
-    else:
-        print(" -> Core dependencies are already installed.")
+    run_command(f"{sys.executable} -m pip install -r requirements.txt")
 
 
-def download_vosk_model(status):
+def download_vosk_model(status: dict) -> None:
     if status['model_installed']:
-        print(f"\n{BOLD}[*] Vosk model already exists. Skipping download.{RESET}")
         return
 
-    model_dir = "model"
     model_url = "https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip"
     zip_path = "vosk_model.zip"
-
-    print(f"\n{BOLD}[*] Downloading Vosk STT Model (50MB) from {model_url}...{RESET}")
+    print(f"\n{BOLD}[*] Downloading Vosk STT Model (50MB)...{RESET}")
 
     try:
         context = ssl._create_unverified_context()
-
         with urllib.request.urlopen(model_url, context=context) as response, open(zip_path, 'wb') as out_file:
-            data = response.read()
-            out_file.write(data)
-
-        print(" -> Download complete. Extracting...")
+            out_file.write(response.read())
 
         with zipfile.ZipFile(zip_path, 'r') as zip_ref:
             zip_ref.extractall(".")
 
-        extracted_folder = "vosk-model-small-en-us-0.15"
-        if os.path.exists(extracted_folder):
-            os.rename(extracted_folder, model_dir)
-
+        os.rename("vosk-model-small-en-us-0.15", "model")
         os.remove(zip_path)
+
+        sudo_user = os.environ.get("SUDO_USER")
+        if sudo_user and os.path.exists("model"):
+            import pwd
+            uid = pwd.getpwnam(sudo_user).pw_uid
+            gid = pwd.getpwnam(sudo_user).pw_gid
+            for root, dirs, files in os.walk("model"):
+                for d in dirs: os.chown(os.path.join(root, d), uid, gid)
+                for f in files: os.chown(os.path.join(root, f), uid, gid)
+            os.chown("model", uid, gid)
+
         print(f" {GREEN}-> Vosk model successfully installed.{RESET}")
     except Exception as e:
-        print(f"\n{RED}[Error] Failed to download or extract the Vosk model: {e}{RESET}")
-        print(f"Manual fallback: Download from {model_url} and unzip to a folder named 'model'.")
+        print(f"{RED}[Error] Failed to download model: {e}{RESET}")
 
 
-def main():
+def main() -> None:
     sys_info = get_system_info()
     status = evaluate_environment(sys_info)
 
-    print_plan(sys_info, status)
+    enforce_sudo_on_linux(sys_info)
 
-    if all(status.values()):
-        print(f"\n{GREEN}Everything is already set up! You are ready to go.{RESET}")
-        confirm = input("Do you want to run the installer anyway? (y/n): ").strip().lower()
-        if confirm not in ['y', 'yes']:
-            sys.exit(0)
-    else:
-        confirm = input("Do you want to proceed with the setup? (y/n): ").strip().lower()
-        if confirm not in ['y', 'yes']:
-            print("Setup aborted by user.")
-            sys.exit(0)
+    clear_screen()
+    print(f"{BOLD}========================================{RESET}")
+    print(f"{BOLD}      EIDOLON ENVIRONMENT SETUP{RESET}")
+    print(f"{BOLD}========================================{RESET}\n")
+    print(f"Detected OS: {sys_info['os']} ({sys_info.get('pkg_manager', 'N/A')})\n")
 
     install_system_dependencies(sys_info, status)
-    install_python_dependencies(sys_info, status)
+    install_python_dependencies()
     download_vosk_model(status)
 
     print(f"\n{BOLD}========================================{RESET}")
     print(f"{GREEN}{BOLD} SETUP COMPLETE!{RESET}")
     print(f"{BOLD}========================================{RESET}")
 
-    if sys_info['os'] == 'darwin':
-        print(f"\n{YELLOW}[IMPORTANT] macOS Privacy Permissions:{RESET}")
-        print(" 1. Go to System Settings > Privacy & Security > Bluetooth")
-        print("    -> Grant access to your Terminal / IDE.")
-        print(" 2. Go to System Settings > Privacy & Security > Microphone")
-        print("    -> Grant access to your Terminal / IDE.")
-        print(f"    {YELLOW}(If you skip the microphone step, PyAudio will record pure silence or crash).{RESET}")
-
-    print(f"\n{BOLD}You can now start the proxy by running:{RESET} {GREEN}python main.py{RESET}")
+    if sys_info['os'].startswith('linux'):
+        print(f"\n{YELLOW}[IMPORTANT] Linux Raw Socket Permissions:{RESET}")
+        print(" Because this script bypasses DBus and talks to the kernel directly,")
+        print(f" you MUST run the main script with sudo:\n")
+        print(f" {GREEN}sudo {sys.executable} main.py{RESET}\n")
 
 
 if __name__ == "__main__":
