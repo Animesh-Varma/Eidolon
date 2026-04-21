@@ -7,7 +7,6 @@
 
 import asyncio
 import curses
-import json
 import logging
 import os
 import re
@@ -16,10 +15,8 @@ import sys
 import threading
 import time
 import queue
-import wave
 
 import numpy as np
-import speech_recognition as sr
 import edge_tts
 
 if 'TERM' not in os.environ:
@@ -63,26 +60,26 @@ class LocalAIEngine:
         self.in_call = False
 
         # Audio Pipeline
-        self.recognizer = sr.Recognizer()
         self.speech_buffer = bytearray()
         self.stt_active = False
         self.tts_active = False
         self.silence_chunks = 0
         self.RMS_THRESHOLD = 300
 
-        # Tier 1: Quick & Dirty Live STT
+        # Production-Grade STT (Faster-Whisper)
         try:
-            from vosk import Model, KaldiRecognizer, SetLogLevel
-            SetLogLevel(-1)
-            if os.path.exists("model"):
-                self.vosk_model = Model("model")
-                self.vosk_rec = KaldiRecognizer(self.vosk_model, 16000)
-            else:
-                self.ui_queue.put(("log", "[Warning] Vosk 'model' missing. Live STT disabled."))
-                self.vosk_rec = None
+            from faster_whisper import WhisperModel
+            self.ui_queue.put(("log", "[*] Loading Whisper AI Model (base.en)..."))
+            # 'base.en' is extremely fast and accurate on CPU.
+            # (Use 'small.en' if you have a dedicated GPU)
+            self.stt_model = WhisperModel("base.en", device="auto", compute_type="int8")
+            self.ui_queue.put(("log", "[✔] Whisper AI Online!"))
         except ImportError:
-            self.ui_queue.put(("log", "[Warning] 'vosk' module missing. Live STT disabled."))
-            self.vosk_rec = None
+            self.stt_model = None
+            self.ui_queue.put(("log", "[Error] 'faster-whisper' missing! Run: pip install faster-whisper"))
+        except Exception as e:
+            self.stt_model = None
+            self.ui_queue.put(("log", f"[STT Init Error]: {e}"))
 
     def process_bluetooth_events(self):
         while self.running:
@@ -110,56 +107,71 @@ class LocalAIEngine:
                 time.sleep(0.1)
                 continue
 
+            # Must continuously drain the socket to prevent TCP Deadlocks!
+            audio_chunk = self.bt_controller.read_audio(2048)
+
             if self.tts_active:
                 self.speech_buffer.clear()
                 self.stt_active = False
-                time.sleep(0.1)
                 continue
 
-            audio_chunk = self.bt_controller.read_audio(2048)
             if audio_chunk:
                 audio_array = np.frombuffer(audio_chunk, dtype=np.int16)
                 rms = np.sqrt(np.mean(audio_array.astype(np.float32) ** 2))
 
                 if rms > self.RMS_THRESHOLD:
-                    self.stt_active = True
+                    if not self.stt_active:
+                        self.stt_active = True
+                        self.ui_queue.put(("live", "Listening..."))
+
                     self.silence_chunks = 0
                     self.speech_buffer.extend(audio_chunk)
-
-                    if self.vosk_rec:
-                        if self.vosk_rec.AcceptWaveform(audio_chunk):
-                            self.ui_queue.put(("live", ""))
-                        else:
-                            partial = json.loads(self.vosk_rec.PartialResult()).get("partial", "")
-                            if partial:
-                                self.ui_queue.put(("live", partial))
 
                 elif self.stt_active:
                     self.silence_chunks += 1
                     self.speech_buffer.extend(audio_chunk)
 
+                    # Trigger STT after ~0.5 seconds of silence
                     if self.silence_chunks > 8 or len(self.speech_buffer) > 256000:
                         chunk_to_process = bytes(self.speech_buffer)
                         self.speech_buffer.clear()
                         self.stt_active = False
                         self.silence_chunks = 0
-                        self.ui_queue.put(("live", ""))
+                        self.ui_queue.put(("live", "Transcribing..."))
 
-                        if self.vosk_rec:
-                            self.vosk_rec.Reset()
-
-                        if len(chunk_to_process) > 16000:
+                        if len(chunk_to_process) > 16000:  # Ensure we have at least 0.5s of audio
                             threading.Thread(target=self._async_stt, args=(chunk_to_process,), daemon=True).start()
+                        else:
+                            self.ui_queue.put(("live", ""))
 
     def _async_stt(self, raw_bytes: bytes):
-        audio_data = sr.AudioData(raw_bytes, 16000, 2)
+        if not self.stt_model:
+            self.ui_queue.put(("chat", "[STT Error]: Whisper AI is not loaded."))
+            self.ui_queue.put(("live", ""))
+            return
+
         try:
-            text = self.recognizer.recognize_google(audio_data)
-            self.ui_queue.put(("chat", f"[Caller]: {text}"))
-        except sr.UnknownValueError:
-            pass
+            # Whisper natively requires a float32 NumPy array ranging from -1.0 to 1.0
+            audio_np = np.frombuffer(raw_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+
+            # Transcribe with AI Voice Activity Detection (VAD) to filter out Bluetooth static
+            segments, info = self.stt_model.transcribe(
+                audio_np,
+                beam_size=5,
+                language="en",
+                vad_filter=True,
+                vad_parameters=dict(min_silence_duration_ms=500)
+            )
+
+            text = "".join([segment.text for segment in segments]).strip()
+
+            if text:
+                self.ui_queue.put(("chat", f"[Caller]: {text}"))
+
         except Exception as e:
-            self.ui_queue.put(("chat", f"[STT Error]: {e}"))
+            self.ui_queue.put(("chat", f"[STT Process Error]: {e}"))
+        finally:
+            self.ui_queue.put(("live", ""))
 
     def process_outgoing_text(self):
         while self.running:
@@ -186,27 +198,23 @@ class LocalAIEngine:
                     temp_mp3 = "/tmp/eidolon_tts.mp3"
                     temp_pcm = "/tmp/eidolon_tts.pcm"
 
-                    # 1. Generate Neural TTS
                     async def _generate():
                         communicate = edge_tts.Communicate(text, "en-US-AriaNeural")
                         await communicate.save(temp_mp3)
 
                     asyncio.run(_generate())
 
-                    # 2. Use ffmpeg to convert MP3 to RAW 8kHz PCM directly!
                     subprocess.run([
                         'ffmpeg', '-y', '-i', temp_mp3,
-                        '-f', 's16le', '-ac', '1', '-ar', '8000',
+                        '-f', 's16le', '-ac', '1', '-ar', '16000',
                         temp_pcm
                     ], check=True, capture_output=True)
 
-                    # 3. Read the raw bytes and push to the phone
                     if os.path.exists(temp_pcm):
                         with open(temp_pcm, 'rb') as f:
                             audio_bytes = f.read()
 
-                        # Pass sample_rate=8000
-                        self.bt_controller.write_audio(audio_bytes, sample_rate=8000)
+                        self.bt_controller.write_audio(audio_bytes, sample_rate=16000)
 
                 except Exception as e:
                     self.ui_queue.put(("log", f"[TTS Error]: {e}"))
@@ -310,7 +318,7 @@ class CursesTUI:
 
             if self.live_stt:
                 try:
-                    stdscr.addnstr(log_h + chat_h - 1, 2, f"Live: {self.live_stt}...", w - 4,
+                    stdscr.addnstr(log_h + chat_h - 1, 2, f"STT State: {self.live_stt}", w - 4,
                                    curses.color_pair(4) | curses.A_DIM)
                 except curses.error:
                     pass
@@ -326,10 +334,11 @@ class CursesTUI:
 class EidolonOrchestrator:
     def __init__(self):
         self.ui_queue = queue.Queue()
+        self.bt_controller = get_os_controller()
+
         self.original_stdout = sys.stdout
         sys.stdout = StdoutRedirector(self.ui_queue)
 
-        self.bt_controller = get_os_controller()
         self.ai = LocalAIEngine(self.bt_controller, self.ui_queue)
         self.tui = CursesTUI(self.ai, self.ui_queue)
 

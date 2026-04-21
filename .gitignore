@@ -1,2 +1,36 @@
-.idea
-/model/
+# ========================
+# IDE & OS Settings
+# ========================
+.idea/
+.vscode/
+.DS_Store
+
+# ========================
+# Machine Learning Models
+# ========================
+model/
+vosk_model*.zip
+
+# ========================
+# ESP-IDF Firmware Build & Secrets
+# ========================
+esp32_firmware/eidolon_hfp/build/
+esp32_firmware/eidolon_hfp/sdkconfig.old
+esp32_firmware/eidolon_hfp/managed_components/
+esp32_firmware/eidolon_hfp/main/wifi_credentials.h
+
+# ========================
+# Python Virtual Env & Cache
+# ========================
+__pycache__/
+*.pyc
+.venv/
+venv/
+env/
+
+# ========================
+# Temporary Audio Files
+# ========================
+*.mp3
+*.pcm
+*.wav

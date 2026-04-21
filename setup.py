@@ -7,6 +7,7 @@ import subprocess
 import sys
 import urllib.request
 import zipfile
+import socket
 
 if 'TERM' not in os.environ:
     os.environ['TERM'] = 'xterm-256color'
@@ -43,7 +44,6 @@ def get_system_info() -> dict:
         "linux_distro": None,
         "pkg_manager": None
     }
-
     if sys_info['os'].startswith('linux'):
         if shutil.which('pacman'):
             sys_info['pkg_manager'] = "pacman"
@@ -67,46 +67,12 @@ def evaluate_environment(sys_info: dict) -> dict:
 
 
 def enforce_sudo_on_linux(sys_info: dict) -> None:
-    """Gracefully exits and provides the exact command if not running as root on Linux."""
     if sys_info['os'].startswith('linux') and os.geteuid() != 0:
         clear_screen()
         print(f"{RED}{BOLD}[Error] Root privileges required for system setup.{RESET}")
-        print("This script needs to install packages via your package manager (pacman/apt/dnf).")
-        print("Please re-run this setup script using sudo, pointing to your virtual environment:\n")
+        print("Please re-run this setup script using sudo:\n")
         print(f"  {GREEN}sudo {sys.executable} setup.py{RESET}\n")
         sys.exit(1)
-
-
-def apply_linux_audio_overrides() -> None:
-    print(f"\n{BOLD}[*] Configuring Linux Sound Server Overrides...{RESET}")
-
-    sudo_user = os.environ.get("SUDO_USER")
-    if sudo_user:
-        import pwd
-        home = pwd.getpwnam(sudo_user).pw_dir
-    else:
-        home = os.path.expanduser("~")
-
-    if shutil.which("wireplumber"):
-        wp_dir = os.path.join(home, ".config", "wireplumber", "wireplumber.conf.d")
-        os.makedirs(wp_dir, exist_ok=True)
-        wp_file = os.path.join(wp_dir, "51-disable-hfp.conf")
-
-        with open(wp_file, "w") as f:
-            f.write("monitor.bluez.properties = {\n  bluez5.roles = [ a2dp_sink a2dp_source ]\n}\n")
-
-        if sudo_user:
-            uid = pwd.getpwnam(sudo_user).pw_uid
-            gid = pwd.getpwnam(sudo_user).pw_gid
-            os.chown(wp_file, uid, gid)
-            os.chown(wp_dir, uid, gid)
-
-        print(f" {GREEN}[✔]{RESET} WirePlumber HFP grab disabled. (Applied to user {sudo_user or 'current'})")
-        print(f" {YELLOW}-> Please run `systemctl --user restart wireplumber` AFTER setup, or reboot.{RESET}")
-
-    elif shutil.which("pulseaudio"):
-        print(
-            f"{YELLOW}[!] Notice: Running PulseAudio. You may need to manually unload module-bluetooth-discover.{RESET}")
 
 
 def install_system_dependencies(sys_info: dict) -> None:
@@ -119,12 +85,9 @@ def install_system_dependencies(sys_info: dict) -> None:
         elif sys_info['pkg_manager'] == 'dnf':
             cmd = "dnf install -y bluez bluez-tools portaudio-devel python3-pyaudio ffmpeg"
         else:
-            print(f"{YELLOW}[!] Unknown package manager. Please install bluez, portaudio, and ffmpeg manually.{RESET}")
             return
-
         print(f" -> Running: {cmd}")
         run_command(cmd)
-        apply_linux_audio_overrides()
 
 
 def install_python_dependencies() -> None:
@@ -133,8 +96,7 @@ def install_python_dependencies() -> None:
 
 
 def download_vosk_model(status: dict) -> None:
-    if status['model_installed']:
-        return
+    if status['model_installed']: return
 
     model_url = "https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip"
     zip_path = "vosk_model.zip"
@@ -166,6 +128,136 @@ def download_vosk_model(status: dict) -> None:
         print(f"{RED}[Error] Failed to download model: {e}{RESET}")
 
 
+def get_current_ssid() -> str:
+    """Attempt to auto-detect the currently connected Wi-Fi SSID."""
+    try:
+        if sys.platform == 'darwin':
+            out = subprocess.check_output(['networksetup', '-getairportnetwork', 'en0'], stderr=subprocess.DEVNULL,
+                                          text=True)
+            if "Current Wi-Fi Network" in out:
+                return out.split(": ")[1].strip()
+        elif sys.platform.startswith('linux'):
+            if shutil.which('iwgetid'):
+                out = subprocess.check_output(['iwgetid', '-r'], stderr=subprocess.DEVNULL, text=True)
+                return out.strip()
+        elif sys.platform == 'win32':
+            out = subprocess.check_output(['netsh', 'wlan', 'show', 'interfaces'], stderr=subprocess.DEVNULL, text=True)
+            for line in out.split('\n'):
+                if " SSID" in line and "BSSID" not in line:
+                    return line.split(":")[1].strip()
+    except Exception:
+        pass
+    return ""
+
+
+def configure_firmware_credentials():
+    print(f"\n{BOLD}========================================{RESET}")
+    print(f"{BOLD}      ESP32 NETWORK CONFIGURATION       {RESET}")
+    print(f"{BOLD}========================================{RESET}")
+
+    # Attempt to auto-detect the Host IP address on the local network
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        default_ip = s.getsockname()[0]
+        s.close()
+    except Exception:
+        default_ip = "192.168.1.100"
+
+    default_ssid = get_current_ssid()
+
+    print(f"{YELLOW}The ESP32 needs your Wi-Fi credentials to bridge audio to this machine.{RESET}\n")
+
+    while True:
+        if default_ssid:
+            ssid = input(f"Enter Wi-Fi SSID [{default_ssid}]: ").strip()
+            if not ssid:
+                ssid = default_ssid
+        else:
+            ssid = input(f"Enter Wi-Fi SSID: ").strip()
+
+        if not ssid:
+            continue
+
+        # --- 5GHz Compatibility Warning ---
+        if "5g" in ssid.lower() or "5.8" in ssid:
+            print(f"\n{YELLOW}{BOLD}[!] WARNING: Possible 5GHz Wi-Fi Network Detected!{RESET}")
+            print(f"{YELLOW}Standard ESP32 chips (like ESP32-WROOM) DO NOT support 5GHz Wi-Fi.{RESET}")
+            print(f"{YELLOW}If this is a 5GHz-only network, the ESP32 will fail to connect.{RESET}")
+            confirm = input(f"Are you sure your specific ESP32 board supports 5GHz? (y/N): ").strip().lower()
+            if confirm != 'y':
+                print(f"{GREEN}Let's try again with a 2.4GHz network...{RESET}\n")
+                default_ssid = ""  # Clear auto-fill to force re-type
+                continue
+
+        break  # SSID is approved
+
+    password = input(f"Enter Wi-Fi Password: ").strip()
+
+    host_ip = input(f"Enter Host Machine IP [{default_ip}]: ").strip()
+    if not host_ip:
+        host_ip = default_ip
+
+    # Generate the header file for the C compiler
+    header_path = os.path.join("esp32_firmware", "eidolon_hfp", "main", "wifi_credentials.h")
+
+    os.makedirs(os.path.dirname(header_path), exist_ok=True)
+
+    with open(header_path, "w") as f:
+        f.write("#pragma once\n\n")
+        f.write(f'#define WIFI_SSID      "{ssid}"\n')
+        f.write(f'#define WIFI_PASS      "{password}"\n')
+        f.write(f'#define HOST_IP        "{host_ip}"\n')
+
+    print(f"\n{GREEN}[*] Credentials safely generated in: {header_path}{RESET}")
+
+
+def setup_esp32_flasher():
+    print(f"\n{BOLD}========================================{RESET}")
+    print(f"{BOLD}      ESP32 FIRMWARE FLASH UTILITY      {RESET}")
+    print(f"{BOLD}========================================{RESET}")
+
+    base_dir = os.getcwd()
+    firmware_dir = os.path.join(base_dir, "esp32_firmware", "eidolon_hfp")
+
+    script_name = "idc_run.sh" if os.path.exists(
+        os.path.join(base_dir, "esp32_firmware", "idc_run.sh")) else "idf_run.sh"
+    script_path = os.path.join("..", script_name)
+
+    if not os.path.exists(firmware_dir):
+        print(f"{YELLOW}[!] ESP32 Firmware directory not found at {firmware_dir}. Skipping...{RESET}")
+        return
+
+    choice = input("Do you want to flash the ESP32 Bridge over USB right now? (y/N): ").strip().lower()
+
+    if choice == 'y':
+        port = input(f"Enter the serial port (e.g. /dev/cu.usbserial-110) or press Enter to auto-detect: ").strip()
+
+        os.chdir(firmware_dir)
+
+        cmd_args = ["bash", script_path]
+        if port:
+            cmd_args.extend(["-p", port])
+
+        cmd_args.extend(["build", "flash"])
+
+        if os.geteuid() == 0 and sys.platform.startswith('linux'):
+            sudo_user = os.environ.get("SUDO_USER")
+            if sudo_user:
+                print(f"{YELLOW}[!] Dropping to user '{sudo_user}' to preserve ESP-IDF Environment...{RESET}")
+                cmd_args = ["sudo", "-u", sudo_user] + cmd_args
+
+        print(f"\n{YELLOW}[*] Executing in {os.getcwd()}: {' '.join(cmd_args)}{RESET}")
+        try:
+            subprocess.run(cmd_args, check=True)
+        except Exception as e:
+            print(f"{RED}[Error] Failed to execute ESP-IDF script: {e}{RESET}")
+            os.chdir(base_dir)
+            return
+        finally:
+            os.chdir(base_dir)
+
+
 def main() -> None:
     sys_info = get_system_info()
     status = evaluate_environment(sys_info)
@@ -174,23 +266,32 @@ def main() -> None:
 
     clear_screen()
     print(f"{BOLD}========================================{RESET}")
-    print(f"{BOLD}      EIDOLON ENVIRONMENT SETUP{RESET}")
+    print(f"{BOLD}      EIDOLON ENVIRONMENT SETUP         {RESET}")
     print(f"{BOLD}========================================{RESET}\n")
-    print(f"Detected OS: {sys_info['os']} ({sys_info.get('pkg_manager', 'N/A')})\n")
 
-    install_system_dependencies(sys_info, status)
+    install_system_dependencies(sys_info)
     install_python_dependencies()
     download_vosk_model(status)
 
+    # Prompt for credentials dynamically before flashing
+    configure_firmware_credentials()
+
     print(f"\n{BOLD}========================================{RESET}")
-    print(f"{GREEN}{BOLD} SETUP COMPLETE!{RESET}")
+    print(f"{GREEN}{BOLD} ENVIRONMENT SETUP COMPLETE!{RESET}")
     print(f"{BOLD}========================================{RESET}")
 
+    setup_esp32_flasher()
+
+    # --- FINAL INSTRUCTIONS ---
+    print(f"\n{BOLD}{GREEN}===================================================={RESET}")
+    print(f"{BOLD}{GREEN}  SUCCESS: Environment & Firmware Ready!{RESET}")
+    print(f"{BOLD}{GREEN}===================================================={RESET}")
+    print(f"{YELLOW}To start the AI Bridge, please open a NEW terminal window and run:{RESET}")
+
     if sys_info['os'].startswith('linux'):
-        print(f"\n{YELLOW}[IMPORTANT] Linux Raw Socket Permissions:{RESET}")
-        print(" Because this script bypasses DBus and talks to the kernel directly,")
-        print(f" you MUST run the main script with sudo:\n")
-        print(f" {GREEN}sudo {sys.executable} main.py{RESET}\n")
+        print(f"  {BOLD}sudo {sys.executable} main.py{RESET}\n")
+    else:
+        print(f"  {BOLD}{sys.executable} main.py{RESET}\n")
 
 
 if __name__ == "__main__":
