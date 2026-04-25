@@ -59,6 +59,11 @@ class LocalAIEngine:
         self.running = True
         self.in_call = False
 
+        # Architecture Detection for Sample Rates
+        # ESP32 uses Wideband Speech (16kHz). Native Linux CVSD uses Narrowband (8kHz).
+        self.is_esp32 = self.bt_controller.__class__.__name__ == "ESP32Controller"
+        self.hw_sample_rate = 16000 if self.is_esp32 else 8000
+
         # Audio Pipeline
         self.speech_buffer = bytearray()
         self.stt_active = False
@@ -70,10 +75,27 @@ class LocalAIEngine:
         try:
             from faster_whisper import WhisperModel
             self.ui_queue.put(("log", "[*] Loading Whisper AI Model (base.en)..."))
-            # 'base.en' is extremely fast and accurate on CPU.
-            # (Use 'small.en' if you have a dedicated GPU)
+
+            # Start by attempting auto-GPU detection
             self.stt_model = WhisperModel("base.en", device="auto", compute_type="int8")
-            self.ui_queue.put(("log", "[✔] Whisper AI Online!"))
+
+            try:
+                # DUMMY RUN: ctranslate2 lazily loads CUDA binaries. We pass 1 second of
+                # silence to force the C++ library to boot. If CUDA 13 is present but it
+                # needs CUDA 12, it will crash HERE instead of during a live call!
+                segments, _ = self.stt_model.transcribe(np.zeros(16000, dtype=np.float32))
+                list(segments)  # Evaluate generator
+                self.ui_queue.put(("log", "[✔] Whisper AI Online (GPU Accelerated)!"))
+            except Exception as e:
+                err = str(e).lower()
+                if "libcublas.so.12" in err or "cuda" in err or "cublas" in err:
+                    self.ui_queue.put(("log", f"[!] CUDA 13/Incompatible GPU Detected. Intercepting crash..."))
+                    self.ui_queue.put(("log", f"[*] Falling back to pure CPU mode..."))
+                    self.stt_model = WhisperModel("base.en", device="cpu", compute_type="int8")
+                    self.ui_queue.put(("log", "[✔] Whisper AI Online (CPU Mode)!"))
+                else:
+                    raise e
+
         except ImportError:
             self.stt_model = None
             self.ui_queue.put(("log", "[Error] 'faster-whisper' missing! Run: pip install faster-whisper"))
@@ -107,7 +129,6 @@ class LocalAIEngine:
                 time.sleep(0.1)
                 continue
 
-            # Must continuously drain the socket to prevent TCP Deadlocks!
             audio_chunk = self.bt_controller.read_audio(2048)
 
             if self.tts_active:
@@ -139,12 +160,18 @@ class LocalAIEngine:
                         self.silence_chunks = 0
                         self.ui_queue.put(("live", "Transcribing..."))
 
-                        if len(chunk_to_process) > 16000:  # Ensure we have at least 0.5s of audio
-                            threading.Thread(target=self._async_stt, args=(chunk_to_process,), daemon=True).start()
+                        min_audio_bytes = self.hw_sample_rate * 2 * 0.5
+
+                        if len(chunk_to_process) >= min_audio_bytes:
+                            threading.Thread(
+                                target=self._async_stt,
+                                args=(chunk_to_process, self.hw_sample_rate),
+                                daemon=True
+                            ).start()
                         else:
                             self.ui_queue.put(("live", ""))
 
-    def _async_stt(self, raw_bytes: bytes):
+    def _async_stt(self, raw_bytes: bytes, sample_rate: int):
         if not self.stt_model:
             self.ui_queue.put(("chat", "[STT Error]: Whisper AI is not loaded."))
             self.ui_queue.put(("live", ""))
@@ -154,7 +181,17 @@ class LocalAIEngine:
             # Whisper natively requires a float32 NumPy array ranging from -1.0 to 1.0
             audio_np = np.frombuffer(raw_bytes, dtype=np.int16).astype(np.float32) / 32768.0
 
-            # Transcribe with AI Voice Activity Detection (VAD) to filter out Bluetooth static
+            if sample_rate == 8000:
+                audio_16k = np.zeros(len(audio_np) * 2, dtype=np.float32)
+                audio_16k[0::2] = audio_np  # Map old samples to even indices
+                audio_16k[1::2][:-1] = (audio_np[:-1] + audio_np[1:]) / 2.0
+                audio_16k[-1] = audio_np[-1]
+                audio_np = audio_16k
+
+            max_amp = np.max(np.abs(audio_np))
+            if 0.0 < max_amp < 0.9:
+                audio_np = audio_np * (0.9 / max_amp)
+
             segments, info = self.stt_model.transcribe(
                 audio_np,
                 beam_size=5,
@@ -204,9 +241,10 @@ class LocalAIEngine:
 
                     asyncio.run(_generate())
 
+                    # Dynamically encode to 16kHz for ESP32, or 8kHz for Linux Native CVSD
                     subprocess.run([
                         'ffmpeg', '-y', '-i', temp_mp3,
-                        '-f', 's16le', '-ac', '1', '-ar', '16000',
+                        '-f', 's16le', '-ac', '1', '-ar', str(self.hw_sample_rate),
                         temp_pcm
                     ], check=True, capture_output=True)
 
@@ -214,7 +252,7 @@ class LocalAIEngine:
                         with open(temp_pcm, 'rb') as f:
                             audio_bytes = f.read()
 
-                        self.bt_controller.write_audio(audio_bytes, sample_rate=16000)
+                        self.bt_controller.write_audio(audio_bytes, sample_rate=self.hw_sample_rate)
 
                 except Exception as e:
                     self.ui_queue.put(("log", f"[TTS Error]: {e}"))

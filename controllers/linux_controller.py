@@ -4,6 +4,7 @@ import socket
 import subprocess
 import threading
 import time
+import select
 from typing import List, Tuple, Optional
 
 import numpy as np
@@ -209,36 +210,32 @@ class LinuxController(BaseController):
 
     def read_audio(self, chunk_size: int) -> bytes:
         if not self.in_call or not self.sco_conn:
-            time.sleep(0.1)
-            return b'\x00' * chunk_size
+            time.sleep(0.05)
+            return b''
 
-        target_8k_bytes = chunk_size // 2
         buf = bytearray()
+        try:
+            ready, _, _ = select.select([self.sco_conn], [], [], 0.05)
+            if ready:
+                while True:
+                    packet = self.sco_conn.recv(4096)
+                    if packet:
+                        buf.extend(packet)
 
-        while len(buf) < target_8k_bytes and self.in_call and self.sco_conn:
-            try:
-                packet = self.sco_conn.recv(1024)
-                if packet:
-                    buf.extend(packet)
-                else:
-                    break
-            except socket.timeout:
-                pass
-            except Exception:
-                break
+                    r, _, _ = select.select([self.sco_conn], [], [], 0.0)
+                    if not r:
+                        break
+        except Exception:
+            pass
 
-        if len(buf) > 0:
-            arr_8k = np.frombuffer(bytes(buf), dtype=np.int16)
-            arr_16k = np.repeat(arr_8k, 2)
-            return arr_16k.tobytes()
-
-        return b'\x00' * chunk_size
+        even_len = len(buf) - (len(buf) % 2)
+        return bytes(buf[:even_len])
 
     def write_audio(self, audio_bytes: bytes, sample_rate: int = 8000) -> None:
         if not self.sco_conn or not self.in_call:
             return
 
-        chunk_size = 48
+        chunk_size = 48  # Kernel SCO MTU Standard
 
         try:
             for i in range(0, len(audio_bytes), chunk_size):
@@ -249,6 +246,7 @@ class LinuxController(BaseController):
 
                 if len(chunk) < chunk_size:
                     chunk += b'\x00' * (chunk_size - len(chunk))
+
                 self.sco_conn.send(chunk)
 
         except Exception as e:
