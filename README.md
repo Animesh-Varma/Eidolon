@@ -64,16 +64,20 @@ To avoid memory crashes and give users options based on their privacy needs, I'm
 ### Direct Kernel Injection (Linux Native)
 Here is Eidolon intercepting a live call natively on Linux. The Curses TUI handles the transcriptions and lets me inject generated TTS responses right back into the call.
 
-<div align="center">
-  <video src="media/compressed_linux.mp4" width="100%" controls></video>
-</div>
+
+
+https://github.com/user-attachments/assets/c2e4cb90-b6c4-4239-ad9f-61306e139caf
+
+
 
 ### Untethered Hardware Bypass (ESP32 Mode)
 Here is the system controlling a phone using an ESP32 powered by an external 9V battery. The ESP32 handles the Bluetooth stack and communicates with the Python engine over Wi-Fi. *(Warning: The audio routing is currently super choppy, but the data is flowing!)*
 
-<div align="center">
-  <video src="media/compressed_esp32.mp4" width="100%" controls></video>
-</div>
+
+
+https://github.com/user-attachments/assets/0ae487a3-c349-4db8-9b74-3e8d0944f71f
+
+
 
 ---
 
