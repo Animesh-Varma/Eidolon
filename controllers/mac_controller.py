@@ -28,6 +28,18 @@ IOBluetoothSDPUUID = objc.lookUpClass("IOBluetoothSDPUUID")
 IOBluetoothSDPServiceRecord = objc.lookUpClass("IOBluetoothSDPServiceRecord")
 IOBluetoothDevice = objc.lookUpClass("IOBluetoothDevice")
 
+IOBluetoothDevice = objc.lookUpClass("IOBluetoothDevice")
+
+objc.registerMetaDataForSelector(
+    b"IOBluetoothDevice",
+    b"openRFCOMMChannelSync:withChannelID:delegate:",
+    {
+        'arguments': {
+            2: {'type_modifier': b'o'}\
+        }
+    }
+)
+
 # ==========================================
 # OBJECTIVE-C DELEGATES
 # ==========================================
@@ -71,9 +83,8 @@ class HFPDelegate(Foundation.NSObject):
                 state = self.controller.at_state
 
                 if state == 1:
-                    # Advertise support for CVSD and mSBC Codecs
-                    self.controller.send_at_command(b"AT+BAC=1,2\r")
-                    self.controller.at_state = 2
+                    self.controller.send_at_command(b"AT+CIND=?\r")
+                    self.controller.at_state = 3
                 elif state == 2:
                     self.controller.send_at_command(b"AT+CIND=?\r")
                     self.controller.at_state = 3
@@ -144,12 +155,19 @@ class MacController(BaseController):
         run_loop = NSRunLoop.currentRunLoop()
         end_time = time.time() + duration_seconds
         while time.time() < end_time:
-            run_loop.runMode_beforeDate_(Foundation.NSDefaultRunLoopMode, NSDate.dateWithTimeIntervalSinceNow_(0.1))
+            with objc.autorelease_pool():
+                run_loop.runMode_beforeDate_(
+                    Foundation.NSDefaultRunLoopMode,
+                    NSDate.dateWithTimeIntervalSinceNow_(0.1)
+                )
 
     def send_at_command(self, cmd_bytes: bytes):
         if self.rfcomm_channel and self.channel_is_open:
             self._debug_print(f"Sending: {repr(cmd_bytes)}")
-            self.rfcomm_channel.writeSync_length_(cmd_bytes, len(cmd_bytes))
+
+            buf = ctypes.create_string_buffer(cmd_bytes)
+            buf_address = ctypes.addressof(buf)
+            self.rfcomm_channel.writeSync_length_(buf_address, len(cmd_bytes))
 
     def open_sco_channel(self):
         """Fulfills the Acoustic Bypass: Opens the Mac Mic to feed the OS-Agnostic STT pipeline."""
@@ -202,35 +220,39 @@ class MacController(BaseController):
         return None
 
     def _bluetooth_worker(self):
-        run_loop = NSRunLoop.currentRunLoop()
-        dummy_port = NSPort.port()
-        run_loop.addPort_forMode_(dummy_port, Foundation.NSDefaultRunLoopMode)
+        Foundation.NSThread.currentThread().setName_("EidolonBTWorker")
+
+        with objc.autorelease_pool():
+            run_loop = NSRunLoop.currentRunLoop()
+            dummy_port = NSPort.port()
+            run_loop.addPort_forMode_(dummy_port, Foundation.NSDefaultRunLoopMode)
 
         ag_uuid = IOBluetoothSDPUUID.uuid16_(0x111F)
         connection_success = False
 
         while self.connected and not connection_success:
-            self._debug_print("Hunting for paired phones (Audio Gateways)...")
-            paired_devices = IOBluetoothDevice.pairedDevices()
+            with objc.autorelease_pool():
+                self._debug_print("Hunting for paired phones (Audio Gateways)...")
+                paired_devices = IOBluetoothDevice.pairedDevices()
 
-            if paired_devices:
-                processed_macs = set()
-                for device in paired_devices:
-                    if connection_success: break
+                if paired_devices:
+                    processed_macs = set()
+                    for device in paired_devices:
+                        if connection_success: break
 
-                    addr = device.addressString()
-                    if addr in processed_macs: continue
-                    processed_macs.add(addr)
+                        addr = device.addressString()
+                        if addr in processed_macs: continue
+                        processed_macs.add(addr)
 
-                    ag_record = device.getServiceRecordForUUID_(ag_uuid)
+                        ag_record = device.getServiceRecordForUUID_(ag_uuid)
 
-                    if ag_record:
-                        self.device = device
-                        self._debug_print(f"Found AG Profile on: {device.name()} ({addr})")
+                        if ag_record:
+                            self.device = device
+                            self._debug_print(f"Found AG Profile on: {device.name()} ({addr})")
 
-                        if not device.isConnected():
-                            self._debug_print(f"Waking up {device.name()}...")
-                            device.openConnection()
+                            if not device.isConnected():
+                                self._debug_print(f"Waking up {device.name()}...")
+                                device.openConnection()
 
                         self._pump_runloop(2.0)
                         channel_id = self._extract_rfcomm_channel(ag_record)
@@ -267,7 +289,7 @@ class MacController(BaseController):
 
                                     self.at_state = 1
                                     # Request Codec Negotiation feature (115 + 128 = 243)
-                                    self.send_at_command(b"AT+BRSF=243\r")
+                                    self.send_at_command(b"AT+BRSF=115\r")
 
                                     wait_time = 0.0
                                     while wait_time < 4.0 and not self.probe_replied and self.channel_is_open:
@@ -305,8 +327,10 @@ class MacController(BaseController):
 
     def start_hfp_server(self) -> bool:
         try:
-            sdp_dict = self._create_hfp_sdp_dictionary()
-            self.published_record = IOBluetoothSDPServiceRecord.publishedServiceRecordWithDictionary_(sdp_dict)
+            with objc.autorelease_pool():
+                sdp_dict = self._create_hfp_sdp_dictionary()
+                self.published_record = IOBluetoothSDPServiceRecord.publishedServiceRecordWithDictionary_(sdp_dict)
+
             self.connected = True
             self.bt_worker_thread = threading.Thread(target=self._bluetooth_worker, daemon=True)
             self.bt_worker_thread.start()
@@ -316,17 +340,35 @@ class MacController(BaseController):
             return False
 
     def read_audio(self, chunk_size: int) -> bytes:
-        """Returns raw PCM bytes from the Mac Mic, pretending to be the Bluetooth SCO stream."""
+        """Returns raw PCM bytes from the Mac Mic."""
         if self.mic_stream and self.mic_stream.is_active():
             try:
-                return self.mic_stream.read(chunk_size, exception_on_overflow=False)
+                frames_to_read = chunk_size // 2
+                return self.mic_stream.read(frames_to_read, exception_on_overflow=False)
             except Exception:
                 pass
         return b''
 
-    def write_audio(self, audio_bytes: bytes):
-        if self.sco_channel:
-            self.sco_channel.writeSync_length_(audio_bytes, len(audio_bytes))
+    def write_audio(self, audio_bytes: bytes, sample_rate: int = 16000, **kwargs):
+        """Fulfills the Acoustic Bypass: Plays TTS out of the Mac Speakers."""
+        if not hasattr(self, 'speaker_stream') or not self.speaker_stream:
+            self._debug_print("\033[95m[Acoustic Bypass] Opening Mac Speakers for TTS output...\033[0m")
+            try:
+                self.speaker_stream = self.pyaudio_instance.open(
+                    format=pyaudio.paInt16,
+                    channels=1,
+                    rate=sample_rate,
+                    output=True
+                )
+            except Exception as e:
+                self._debug_print(f"Failed to open Mac Speakers: {e}")
+                return
+
+        if self.speaker_stream and self.speaker_stream.is_active():
+            try:
+                self.speaker_stream.write(audio_bytes)
+            except Exception as e:
+                self._debug_print(f"Failed to play audio: {e}")
 
     def stop_server(self):
         self.connected = False
