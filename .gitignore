@@ -16,6 +16,7 @@ vosk_model*.zip
 # ========================
 esp32_firmware/eidolon_hfp/build/
 esp32_firmware/eidolon_hfp/sdkconfig.old
+esp32_firmware/eidolon_hfp/sdkconfig
 esp32_firmware/eidolon_hfp/managed_components/
 esp32_firmware/eidolon_hfp/main/wifi_credentials.h
 

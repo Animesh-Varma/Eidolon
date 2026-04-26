@@ -12,6 +12,11 @@ from .base_controller import BaseController
 
 DEBUG = True
 
+try:
+    objc.loadBundle("IOBluetooth", globals(), bundle_path=objc.pathForFramework('/System/Library/Frameworks/IOBluetooth.framework'))
+except Exception as e:
+    print(f"[Error] Failed to load macOS IOBluetooth Framework: {e}")
+
 NSMutableDictionary = objc.lookUpClass("NSMutableDictionary")
 NSMutableArray = objc.lookUpClass("NSMutableArray")
 NSNumber = objc.lookUpClass("NSNumber")
@@ -95,7 +100,7 @@ class HFPDelegate(Foundation.NSObject):
             elif "+CIEV: 2,0" in data_str:
                 self.controller.event_queue.put("CALL_SETUP_ENDED")
 
-            # --- CODEC NEGOTIATION (Handled, but Audio is Ignored by macOS Kernel) ---
+            # --- CODEC NEGOTIATION ---
             if "+BCS: 1" in data_str:
                 self.controller.send_at_command(b"AT+BCS=1\r")
             elif "+BCS: 2" in data_str:
@@ -160,7 +165,6 @@ class MacController(BaseController):
                 )
             except Exception as e:
                 self._debug_print(f"Failed to open Mac Mic: {e}")
-
 
     def _create_hfp_sdp_dictionary(self):
         sdp_dict = NSMutableDictionary.dictionary()

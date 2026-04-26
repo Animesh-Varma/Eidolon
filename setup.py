@@ -11,6 +11,7 @@ if 'TERM' not in os.environ:
 
 GREEN, YELLOW, RED, RESET, BOLD = "\033[92m", "\033[93m", "\033[91m", "\033[0m", "\033[1m"
 
+ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 def clear_screen() -> None:
     os.system('cls' if os.name == 'nt' else 'clear')
@@ -42,6 +43,10 @@ def get_system_info() -> dict:
             sys_info['pkg_manager'] = "apt"
         elif shutil.which('dnf'):
             sys_info['pkg_manager'] = "dnf"
+    elif sys_info['os'] == 'darwin':
+        if shutil.which('brew'):
+            sys_info['pkg_manager'] = "brew"
+
     return sys_info
 
 
@@ -73,7 +78,6 @@ def install_system_dependencies(sys_info: dict, arch_choice: str) -> None:
     sudo_user = os.environ.get("SUDO_USER")
 
     if sys_info['os'].startswith('linux'):
-        # 1. Handle Package Installation
         pacman_pkgs = "bluez bluez-utils portaudio ffmpeg"
         apt_pkgs = "bluez bluez-tools portaudio19-dev python3-pyaudio ffmpeg"
         dnf_pkgs = "bluez bluez-tools portaudio-devel python3-pyaudio ffmpeg"
@@ -87,25 +91,40 @@ def install_system_dependencies(sys_info: dict, arch_choice: str) -> None:
             cmd = f"pacman -S --needed --noconfirm {pacman_pkgs}"
             serial_group = "uucp"
         elif sys_info['pkg_manager'] == 'apt':
-            cmd = f"apt-get update && apt-get install -y {apt_pkgs}"
+            print(
+                f"{YELLOW}{BOLD}[!] Note: Ubuntu/Debian (APT) compatibility is currently in BETA. Tread carefully.{RESET}")
+            cmd = f"DEBIAN_FRONTEND=noninteractive apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y {apt_pkgs}"
             serial_group = "dialout"
         elif sys_info['pkg_manager'] == 'dnf':
             cmd = f"dnf install -y {dnf_pkgs}"
             serial_group = "dialout"
         else:
+            print(f"{YELLOW}[!] Unknown Linux package manager. Please install dependencies manually.{RESET}")
             return
 
         run_command(cmd)
 
-        # 2. Handle Serial Port Permissions (uucp/dialout)
         if arch_choice == '2' and sudo_user:
             print(f"{GREEN}[*] Adding user '{sudo_user}' to '{serial_group}' group for ESP32 flashing...{RESET}")
             run_command(f"usermod -aG {serial_group} {sudo_user}")
 
+    elif sys_info['os'] == 'darwin':
+        if sys_info['pkg_manager'] == 'brew':
+            brew_pkgs = "portaudio ffmpeg"
+            if arch_choice == '2':
+                brew_pkgs += " git wget make cmake ninja ccache dfu-util libusb"
+            run_command(f"brew install {brew_pkgs}")
+        else:
+            print(f"{YELLOW}[!] Homebrew not found. Please install dependencies manually.{RESET}")
+
 
 def install_python_dependencies() -> None:
     print(f"\n{BOLD}[*] Installing Python dependencies...{RESET}")
-    run_command(f"{sys.executable} -m pip install -r requirements.txt")
+    req_path = os.path.join(ROOT_DIR, "requirements.txt")
+    if os.path.exists(req_path):
+        run_command(f"{sys.executable} -m pip install -r '{req_path}'")
+    else:
+        print(f"{YELLOW}[!] requirements.txt not found at {req_path}{RESET}")
 
 
 def install_esp_idf():
@@ -114,6 +133,7 @@ def install_esp_idf():
     print(f"{BOLD}========================================{RESET}")
 
     sudo_user = os.environ.get("SUDO_USER")
+
     if sudo_user and os.geteuid() == 0:
         home_dir = os.path.expanduser(f"~{sudo_user}")
         run_as = f"sudo -H -u {sudo_user} bash -c "
@@ -130,7 +150,7 @@ def install_esp_idf():
 
     print(f"{YELLOW}[*] Installing ESP-IDF to {idf_path}...{RESET}")
     os.makedirs(esp_dir, exist_ok=True)
-    if sudo_user: run_command(f"chown -R {sudo_user}:{sudo_user} {esp_dir}")
+    if sudo_user and os.geteuid() == 0: run_command(f"chown -R {sudo_user}:{sudo_user} {esp_dir}")
 
     run_command(f"{run_as} 'git clone -b v5.3.1 --recursive https://github.com/espressif/esp-idf.git \"{idf_path}\"'")
     run_command(f"{run_as} 'cd \"{idf_path}\" && ./install.sh esp32'")
@@ -141,21 +161,26 @@ def configure_firmware_credentials():
     print(f"{BOLD}      ESP32 NETWORK CONFIGURATION       {RESET}")
     print(f"{BOLD}========================================{RESET}")
 
-    header_path = os.path.join("esp32_firmware", "eidolon_hfp", "main", "wifi_credentials.h")
+    # 1. Cleanup the old accidental "ghost" directory if it exists from previous runs
+    ghost_dir = os.path.join(ROOT_DIR, "esp32_firmware", "eidolon_hfp", "esp32_firmware")
+    if os.path.exists(ghost_dir):
+        shutil.rmtree(ghost_dir, ignore_errors=True)
 
-    # Prompt logic
+    header_path = os.path.join(ROOT_DIR, "esp32_firmware", "eidolon_hfp", "main", "wifi_credentials.h")
+
     ssid = input("Enter Wi-Fi SSID: ").strip()
     password = input("Enter Wi-Fi Password: ").strip()
 
     try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM);
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.settimeout(2)
         s.connect(("8.8.8.8", 80))
-        default_ip = s.getsockname()[0];
+        default_ip = s.getsockname()[0]
         s.close()
     except:
         default_ip = "192.168.1.100"
 
-    host_ip = input(f"Enter Host IP [{default_ip}]: ").strip() or default_ip
+    host_ip = input(f"Enter Host IP[{default_ip}]: ").strip() or default_ip
 
     os.makedirs(os.path.dirname(header_path), exist_ok=True)
     with open(header_path, "w") as f:
@@ -163,7 +188,8 @@ def configure_firmware_credentials():
             f'#pragma once\n#define WIFI_SSID "{ssid}"\n#define WIFI_PASS "{password}"\n#define HOST_IP "{host_ip}"\n')
 
     sudo_user = os.environ.get("SUDO_USER")
-    if sudo_user: run_command(f"chown -R {sudo_user}:{sudo_user} {os.path.dirname(header_path)}")
+    if sudo_user and os.geteuid() == 0:
+        run_command(f"chown -R {sudo_user}:{sudo_user} '{os.path.dirname(header_path)}'")
 
 
 def setup_esp32_flasher():
@@ -174,22 +200,24 @@ def setup_esp32_flasher():
     choice = input("Do you want to flash the ESP32 now? (y/N): ").strip().lower()
     if choice != 'y': return
 
-    firmware_dir = os.path.join(os.getcwd(), "esp32_firmware", "eidolon_hfp")
+    firmware_dir = os.path.join(ROOT_DIR, "esp32_firmware", "eidolon_hfp")
     sudo_user = os.environ.get("SUDO_USER")
 
-    # We attempt a manual chmod on the serial port for this session only,
-    # since group changes haven't kicked in yet.
     if sys.platform.startswith('linux'):
         print(f"{YELLOW}[*] Attempting to temporarily unlock serial ports for flashing...{RESET}")
         run_command("chmod 666 /dev/ttyUSB* /dev/ttyACM* 2>/dev/null || true")
 
-    shell_cmd = f"cd '{firmware_dir}' && bash '../idf_run.sh' build flash"
-    cmd_args = ["sudo", "-i", "-u", sudo_user, "bash", "-c", shell_cmd]
+    shell_cmd = f"cd '{firmware_dir}' && bash '../idf_run.sh' erase-flash build flash"
+
+    if sudo_user and os.geteuid() == 0:
+        cmd_args = ["sudo", "-i", "-u", sudo_user, "bash", "-c", shell_cmd]
+    else:
+        cmd_args = ["bash", "-c", shell_cmd]
 
     try:
         subprocess.run(cmd_args, check=True)
-    except:
-        print(f"{RED}[!] Flash failed. This is likely because serial permissions haven't applied yet.{RESET}")
+    except Exception as e:
+        print(f"{RED}[!] Flash failed. Check if your ESP32 is plugged in. ({e}){RESET}")
 
 
 def main() -> None:
@@ -211,12 +239,13 @@ def main() -> None:
     print(f"{BOLD}{GREEN}  SUCCESS: Environment Ready!{RESET}")
     print(f"{BOLD}{GREEN}===================================================={RESET}")
 
-    if arch_choice == '2':
+    if arch_choice == '2' and sys_info['os'].startswith('linux'):
         print(f"{YELLOW}{BOLD}[CRITICAL] ACTION REQUIRED:{RESET}")
         print(f"{YELLOW}To use the ESP32, you might need to Log Out and Log Back In (or reboot).{RESET}")
         print(f"{YELLOW}This applies the new 'uucp/dialout' serial port permissions.{RESET}\n")
 
-    print(f"To start Eidolon, run: {BOLD}sudo {sys.executable} main.py{RESET}\n")
+    run_cmd = f"sudo {sys.executable} main.py" if sys_info['os'].startswith('linux') else f"{sys.executable} main.py"
+    print(f"To start Eidolon, run: {BOLD}{run_cmd}{RESET}\n")
 
 
 if __name__ == "__main__":
